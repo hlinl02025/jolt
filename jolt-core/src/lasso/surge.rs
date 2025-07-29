@@ -11,15 +11,21 @@ use crate::{
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::marker::{PhantomData, Sync};
-
+//NoExogenousOpenings is a zero-sized type, meaning it takes no memory. 
+//StructuredPolynomialData is a trait that aims to organize polynomial data in a way that is easy to read and write
+//VerifierComputedOpening represents the openings that the verifier can compute themselves. 
 use super::memory_checking::{
     Initializable, NoExogenousOpenings, StructuredPolynomialData, VerifierComputedOpening,
 };
 use crate::{
     jolt::instruction::JoltInstruction,
+    //MemoryCheckingProof defines what a proof contains, MemoryCheckingProver defines what a prover needs to do, 
+    // MemoryCheckingVerifier defines what a verifier needs to do
     lasso::memory_checking::{MemoryCheckingProof, MemoryCheckingProver, MemoryCheckingVerifier},
     poly::{
         commitment::commitment_scheme::CommitmentScheme, dense_mlpoly::DensePolynomial,
+        //EqPolynomial dectecs when two vectors are equal
+        //IdentityPolynomial converts binary vectors to field elements
         eq_poly::EqPolynomial, identity_poly::IdentityPolynomial,
     },
     subprotocols::sumcheck::SumcheckInstanceProof,
@@ -40,25 +46,38 @@ pub struct SurgeStuff<T: CanonicalSerialize + CanonicalDeserialize> {
     a_init_final: VerifierComputedOpening<T>,
     v_init_final: VerifierComputedOpening<Vec<T>>,
 }
-
+//SurgePolynomials, SurgeOpenings, and SurgeCommitments are all types that are used to store polynomial data
+//SurgePolynomials is a type that is used to store polynomial data
+//SurgeOpenings is a type that is used to store openings
+//SurgeCommitments is a type that is used to store commitments
 pub type SurgePolynomials<F: JoltField> = SurgeStuff<MultilinearPolynomial<F>>;
 pub type SurgeOpenings<F: JoltField> = SurgeStuff<F>;
 pub type SurgeCommitments<PCS: CommitmentScheme<ProofTranscript>, ProofTranscript: Transcript> =
     SurgeStuff<PCS::Commitment>;
-
+//Initializable traits provides a way to create a SurgeStuff instance with the correct sizes based on the preprocessing data.
 impl<const C: usize, const M: usize, F, T, Instruction>
     Initializable<T, SurgePreprocessing<F, Instruction, C, M>> for SurgeStuff<T>
 where
     F: JoltField,
     T: CanonicalSerialize + CanonicalDeserialize + Default,
     Instruction: JoltInstruction + Default,
-{
-    fn initialize(_preprocessing: &SurgePreprocessing<F, Instruction, C, M>) -> Self {
+{   
+    fn nitialize(_preprocessing: &SurgePreprocessing<F, Instruction, C, M>) -> Self {
+        //num_memories is the number of memories in the instruction
+        //C: Number of dimensions
+        //M: Size of each subtable
+        //F: Field type
+        //T: Type of the polynomial data (polynomials, openings, commitments?)
+        //Instruction: RISC-V instruction type
         let num_memories = C * Instruction::default().subtables::<F>(C, M).len();
         Self {
+            //dim: dimension polynomials (dim_i)
             dim: std::iter::repeat_with(|| T::default()).take(C).collect(),
+            //read_cts: read count polynomials (read_cts_i)
             read_cts: std::iter::repeat_with(|| T::default()).take(C).collect(),
+            //final_cts: final count polynomials (final_cts_i)
             final_cts: std::iter::repeat_with(|| T::default()).take(C).collect(),
+            //E_i polynomials (E_i)
             E_polys: std::iter::repeat_with(|| T::default())
                 .take(num_memories)
                 .collect(),
@@ -101,7 +120,7 @@ where
     F: JoltField,
     Instruction: JoltInstruction + Default + Sync,
     PCS: CommitmentScheme<ProofTranscript, Field = F>,
-{
+{   //The following codes define the type for the MemoryCheckingProver trait. 
     type ReadWriteGrandProduct = BatchedDenseGrandProduct<F>;
     type InitFinalGrandProduct = BatchedDenseGrandProduct<F>;
 
@@ -115,11 +134,17 @@ where
     /// The data associated with each memory slot. A triple (a, v, t) by default.
     type MemoryTuple = (F, F, F); // (a, v, t)
 
+    //fingerprint is a function that computes the fingerprint of a memory tuple
+    //inputs: a tuple of (a, v, t)
+    //gamma: a field element
+    //tau: a field element
+    //returns: a field element (the fingerprint of the memory tuple)    
     fn fingerprint(inputs: &(F, F, F), gamma: &F, tau: &F) -> F {
         let (a, v, t) = *inputs;
         t * gamma.square() + v * *gamma + a - *tau
     }
-
+    //compute_leaves is a function that computes the fingerprints (hashes) for the memory operations
+    //These fingerprints are used to construct grand product circuits for memory consistency checks.    
     #[tracing::instrument(skip_all, name = "Surge::compute_leaves")]
     fn compute_leaves(
         preprocessing: &Self::Preprocessing,
@@ -135,6 +160,13 @@ where
         let read_write_leaves: Vec<_> = (0..Self::num_memories())
             .into_par_iter()
             .flat_map_iter(|memory_index| {
+                //The following steps extract the polynomials for the current memory index
+                //dim_index: the index of the dimension for the current memory index
+                //read_cts: the read count polynomial for the current memory index
+                //E_poly: the E polynomial for the current memory index
+                //dim: the dimension polynomial for the current memory index
+                //read_fingerprints: the fingerprints for the read operations
+                //write_fingerprints: the fingerprints for the write operations
                 let dim_index = Self::memory_to_dimension_index(memory_index);
                 let read_cts: &CompactPolynomial<u32, F> =
                     (&polynomials.read_cts[dim_index]).try_into().unwrap();
@@ -142,6 +174,7 @@ where
                     (&polynomials.E_polys[memory_index]).try_into().unwrap();
                 let dim: &CompactPolynomial<u16, F> =
                     (&polynomials.dim[dim_index]).try_into().unwrap();
+                //Compute the fingerprints for the read operations
                 let read_fingerprints: Vec<F> = (0..num_lookups)
                     .map(|i| {
                         let a = dim[i];
@@ -150,6 +183,9 @@ where
                         t.field_mul(gamma_squared) + v.field_mul(*gamma) + F::from_u16(a) - *tau
                     })
                     .collect();
+                //Compute the fingerprints for the write operations
+                //Write fingerprints are computed by adding a constant to the read fingerprints
+                //t_adjustment is the constant, which is gamma^2. 
                 let t_adjustment = 1u64.field_mul(gamma_squared);
                 let write_fingerprints = read_fingerprints
                     .iter()
@@ -159,7 +195,8 @@ where
                 vec![read_fingerprints, write_fingerprints]
             })
             .collect();
-
+        
+        // Compute fingerprints for initial and final memory states.    
         let init_final_leaves: Vec<_> = (0..Self::num_memories())
             .into_par_iter()
             .flat_map_iter(|memory_index| {
@@ -209,12 +246,19 @@ where
     Instruction: JoltInstruction + Default + Sync,
     ProofTranscript: Transcript,
 {
+    //compute_verifier_openings is a function that the verifier can calculate itself without the prover's help. 
     fn compute_verifier_openings(
         openings: &mut Self::Openings,
         _preprocessing: &Self::Preprocessing,
         _r_read_write: &[F],
         r_init_final: &[F],
     ) {
+        //The following steps compute the openings for the initial and final memory states. 
+        //r_init_final: the openings for the initial memory states
+        //openings.a_init_final: the openings for the initial memory states, 
+        // which is the identity polynomial of the openings for the initial memory states
+        //openings.v_init_final: the openings for the initial memory states, 
+        // which is the evaluation of the subtable polynomials at the openings for the initial memory states
         openings.a_init_final =
             Some(IdentityPolynomial::new(r_init_final.len()).evaluate(r_init_final));
         openings.v_init_final = Some(
@@ -226,38 +270,41 @@ where
         );
     }
 
+    //Reconstruct the memory tuples for the read operations from the polynomial openings
     fn read_tuples(
         _preprocessing: &Self::Preprocessing,
         openings: &Self::Openings,
         _: &NoExogenousOpenings,
     ) -> Vec<Self::MemoryTuple> {
-        (0..Self::num_memories())
+        (0..Self::num_memories())//Iterate over all the memory slots
             .map(|memory_index| {
                 let dim_index = Self::memory_to_dimension_index(memory_index);
                 (
-                    openings.dim[dim_index],
-                    openings.E_polys[memory_index],
-                    openings.read_cts[dim_index],
+                    openings.dim[dim_index], //address
+                    openings.E_polys[memory_index], //value
+                    openings.read_cts[dim_index], //timestamp for read
                 )
             })
             .collect()
     }
+    //Reconstruct the memory tuples for the write operations from the polynomial openings
     fn write_tuples(
         _preprocessing: &Self::Preprocessing,
         openings: &Self::Openings,
         _: &NoExogenousOpenings,
     ) -> Vec<Self::MemoryTuple> {
-        (0..Self::num_memories())
+        (0..Self::num_memories())//Iterate over all the memory slots
             .map(|memory_index| {
                 let dim_index = Self::memory_to_dimension_index(memory_index);
                 (
-                    openings.dim[dim_index],
-                    openings.E_polys[memory_index],
-                    openings.read_cts[dim_index] + F::one(),
+                    openings.dim[dim_index],//address
+                    openings.E_polys[memory_index],//value
+                    openings.read_cts[dim_index] + F::one(),//timestamp for write, which is the timestamp for read plus 1
                 )
             })
             .collect()
     }
+    //Reconstruct the memory tuples for the initial memory states from the polynomial openings
     fn init_tuples(
         _preprocessing: &Self::Preprocessing,
         openings: &Self::Openings,
@@ -266,16 +313,17 @@ where
         let a_init = openings.a_init_final.unwrap();
         let v_init = openings.v_init_final.as_ref().unwrap();
 
-        (0..Self::num_memories())
+        (0..Self::num_memories())//Iterate over all the memory slots
             .map(|memory_index| {
                 (
-                    a_init,
-                    v_init[Self::memory_to_subtable_index(memory_index)],
-                    F::zero(),
+                    a_init, //Address for all initial states
+                    v_init[Self::memory_to_subtable_index(memory_index)], 
+                    F::zero(),//timestamp 0 for all initial states
                 )
             })
             .collect()
     }
+    //Reconstruct the memory tuples for the final memory states from the polynomial openings
     fn final_tuples(
         _preprocessing: &Self::Preprocessing,
         openings: &Self::Openings,
@@ -284,41 +332,43 @@ where
         let a_init = openings.a_init_final.unwrap();
         let v_init = openings.v_init_final.as_ref().unwrap();
 
-        (0..Self::num_memories())
+        (0..Self::num_memories())//Iterate over all the memory slots
             .map(|memory_index| {
                 let dim_index = Self::memory_to_dimension_index(memory_index);
                 (
-                    a_init,
-                    v_init[Self::memory_to_subtable_index(memory_index)],
-                    openings.final_cts[dim_index],
+                    a_init,//Address for all final states
+                    v_init[Self::memory_to_subtable_index(memory_index)],//Value for all final states
+                    openings.final_cts[dim_index],//Timestamp comes from the final count polynomial
                 )
             })
             .collect()
     }
 }
 
+// Define the structure for the primary sumcheck proof
 pub struct SurgePrimarySumcheck<F, ProofTranscript>
 where
     F: JoltField,
     ProofTranscript: Transcript,
 {
-    sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
-    num_rounds: usize,
-    claimed_evaluation: F,
-    E_poly_openings: Vec<F>,
-    _marker: PhantomData<ProofTranscript>,
+    sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,//The actual sumcheck proof
+    num_rounds: usize,//The number of rounds in the primary sumcheck
+    claimed_evaluation: F,//The claimed evaluation of the primary sumcheck
+    E_poly_openings: Vec<F>,//The openings for the E polynomials
+    _marker: PhantomData<ProofTranscript>,//A marker for the proof transcript
 }
-
+//This struct holds precomputed data that doesn't change during proof generation.       
 pub struct SurgePreprocessing<F, Instruction, const C: usize, const M: usize>
 where
     F: JoltField,
     Instruction: JoltInstruction + Default,
 {
-    _instruction: PhantomData<Instruction>,
-    _field: PhantomData<F>,
-    materialized_subtables: Vec<Vec<u32>>,
+    _instruction: PhantomData<Instruction>,//A marker for the instruction
+    _field: PhantomData<F>,//A marker for the field
+    materialized_subtables: Vec<Vec<u32>>,//Precomputed lookup tables for RISC-V instructions
 }
 
+//This struct holds the proof data that changes during proof generation. 
 #[allow(clippy::type_complexity)]
 pub struct SurgeProof<F, PCS, Instruction, const C: usize, const M: usize, ProofTranscript>
 where
@@ -345,13 +395,14 @@ where
 {
     #[tracing::instrument(skip_all, name = "Surge::preprocess")]
     pub fn preprocess() -> Self {
-        let instruction = Instruction::default();
+        //The core preprocessing step is to create the lookup tables for the RISC-V instructions
+        let instruction = Instruction::default(); //create a default intance of the instruction type
 
         let materialized_subtables = instruction
-            .subtables::<F>(C, M)
-            .par_iter()
-            .map(|(subtable, _)| subtable.materialize(M))
-            .collect();
+            .subtables::<F>(C, M) //Get the subtable needed for the instruction
+            .par_iter() //Parallelize the iteration
+            .map(|(subtable, _)| subtable.materialize(M)) //Materialize the subtable
+            .collect(); //Collect the materialized subtable into a vector
 
         // TODO(moodlezoup): do PCS setup here
 
