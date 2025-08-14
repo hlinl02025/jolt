@@ -1,3 +1,29 @@
+// SHOUT Protocol Mathematical Implementation
+//
+// The SHOUT protocol implements the following mathematical equations:
+//
+// 1. Core PIOP Sumcheck (Figure 5):
+//    Σ_{k∈{0,1}^log K} ra(k) * val(k) = Σ_{t∈[T]} val(read_addresses[t])
+//    where ra(k) = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+//
+// 2. Booleanity Check (Figure 6, Step 3):
+//    Σ_{k∈{0,1}^log K, t∈[T]} EQ(r, k) * EQ(r', t) * (F(k,t)^2 - F(k,t)) = 0
+//    where F(k,t) = EQ(k, read_addresses[t])
+//
+// 3. Hamming Weight Check (Figure 6, Step 5):
+//    Σ_{k∈{0,1}^log K} ra(k) = 1
+//    where ra(k) = Σ_{t∈[T]} EQ(r_cycle_prime, t) * δ(k, read_addresses[t])
+//
+// 4. RAF Evaluation (Figure 6, Step 6):
+//    Σ_{k∈{0,1}^log K} ra(k) * k = Σ_{t∈[T]} read_addresses[t] * EQ(r_cycle, t)
+//    where ra(k) = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+//
+// Key Mathematical Components:
+// - EQ(r, x): Equality polynomial EQ(r, x) = Π_{i} (r_i * x_i + (1-r_i) * (1-x_i))
+// - δ(k, a): Kronecker delta function, equals 1 if k = a, 0 otherwise
+// - ra(k): Read address polynomial, counts how many times address k is read
+// - val(k): Value polynomial, stores the value at address k in lookup table
+//
 use super::sumcheck::SumcheckInstanceProof;
 use crate::{
     field::JoltField,
@@ -18,6 +44,14 @@ use crate::{
 };
 use rayon::prelude::*;
 
+// ShoutProof: Contains all the proof components for the SHOUT protocol
+// 
+// Mathematical representation:
+// - core_piop_sumcheck: Proof for Σ_{k∈{0,1}^log K} ra(k) * val(k) = Σ_{t∈[T]} val(read_addresses[t])
+// - booleanity_sumcheck: Proof for Σ_{k,t} EQ(r,k) * EQ(r',t) * (F(k,t)^2 - F(k,t)) = 0
+// - ra_claim: Final claim for read address polynomial: ra(r_address) where r_address is the final challenge
+// - ra_claim_prime: Final claim for read address polynomial in booleanity check: ra(r_address_prime)
+// - rv_claim: Final claim for read value: Σ_{k∈[K]} ra(k) * val(k)
 pub struct ShoutProof<F: JoltField, ProofTranscript: Transcript> {
     core_piop_sumcheck: SumcheckInstanceProof<F, ProofTranscript>,
     booleanity_sumcheck: SumcheckInstanceProof<F, ProofTranscript>,
@@ -28,6 +62,13 @@ pub struct ShoutProof<F: JoltField, ProofTranscript: Transcript> {
 
 impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
     #[tracing::instrument(skip_all, name = "ShoutProof::prove")]
+    // Main proving function for the SHOUT protocol
+    // 
+    // Mathematical setup:
+    // - K = |lookup_table|: Size of the lookup table (domain size)
+    // - T = |read_addresses|: Number of read operations
+    // - r_cycle ∈ F^{log T}: Random challenge for cycle consistency
+    // - z ∈ F: Random challenge for batching core PIOP and Hamming weight
     pub fn prove(
         lookup_table: Vec<F>,
         read_addresses: Vec<usize>,
@@ -40,19 +81,28 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         // Used to batch the core PIOP sumcheck and Hamming weight sumcheck
         // (see Section 4.2.1)
         let z: F = transcript.challenge_scalar();
-
+        // Number of rounds (the number of bits in lookup table size K) for the core PIOP sumcheck
         let num_rounds = K.log_2();
         let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
 
+        // E[t] = EQ(r_cycle, t) for t ∈ [T]
+        // This creates the equality polynomial evaluations for cycle consistency
         let E: Vec<F> = EqPolynomial::evals(r_cycle);
-
+        
+        // Create performance tracing span for computing F
         let span = tracing::span!(tracing::Level::INFO, "compute F");
         let _guard = span.enter();
 
+        // Number of chunks to parallelize the computation of F
         let num_chunks = rayon::current_num_threads()
             .next_power_of_two()
             .min(read_addresses.len());
+        // Size of each chunk
         let chunk_size = (read_addresses.len() / num_chunks).max(1);
+        // F[k] = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+        // This computes the read address polynomial: how many times each address k is read
+        // Huang: This approach doesn't follow the scheme in Fig.5, which doesn't have the concept of chunking
+        // Seem to be the chunking optimization approach from the sparse-dense protocol. Need to check further!!!
         let F: Vec<_> = read_addresses
             .par_chunks(chunk_size)
             .enumerate()
@@ -78,12 +128,21 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         drop(_guard);
         drop(span);
 
+        // rv_claim = Σ_{k∈[K]} F[k] * val(k) = Σ_{k∈[K]} ra(k) * val(k)
+        // This is the core PIOP claim: sum of values weighted by read frequencies
+        // Huang: Note sum of values weighted by read frequencies is Not exactly what's proposed in Fig.5!!!
         let rv_claim: F = F
             .par_iter()
             .zip(lookup_table.par_iter())
             .map(|(&ra, &val)| ra * val)
             .sum();
         // Linear combination of the core PIOP claim and the Hamming weight claim (which is 1)
+        // The core PIOP claim is Σ_{k∈[K]} ra(k) * val(k) = rv_claim
+        // The Hamming weight claim is Σ_{k∈[K]} ra(k) = 1
+        // Now using a random linear combination of the two claims to get the previous claim
+        // previous_claim = rv_claim + z * 1 = Σ_{k∈[K]} ra(k) * val(k) + z * Σ_{k∈[K]} ra(k)
+        // The purpose here is to prove the core PIOP claim and the Hamming weight claim simultaneously
+        // It's easy to understand if we view (Σ_{k∈[K]} ra(k) * val(k), Σ_{k∈[K]} ra(k)) and (rv_claim, 1) as two vectors. 
         let mut previous_claim = rv_claim + z;
 
         let mut ra = MultilinearPolynomial::from(F.clone());
@@ -95,11 +154,21 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         let _guard = span.enter();
 
         // Prove the core PIOP and Hamming weight sumchecks in parallel
+        // For each round j, we compute the univariate polynomial:
+        // s_j(b) = Σ_{k_j'∈{0,1}^(log K - j)} ra(k_j', b) * (z + val(k_j', b))
         let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
         for _ in 0..num_rounds {
             let inner_span = tracing::span!(tracing::Level::INFO, "Compute univariate poly");
             let _inner_guard = inner_span.enter();
 
+            // For each round j, compute the univariate polynomial evaluations:
+            // s_j(0) = Σ_{k_j'∈{0,1}^(log K - j-1)} ra(k_j', 0) * (z + val(k_j', 0))
+            // s_j(1) = Σ_{k_j'∈{0,1}^(log K - j-1)} ra(k_j', 1) * (z + val(k_j', 1))
+            // For each round j, we compute:
+            // s_j(0) = Σ_{i} ra_evals[i][0] * (z + val_evals[i][0])
+            // s_j(1) = Σ_{i} ra_evals[i][1] * (z + val_evals[i][1])
+            // Note: ra_evals[i][0] and ra_evals[i][1] are the evaluations of ra(k_j', 0) and ra(k_j', 1) respectively
+            // Note: val_evals[i][0] and val_evals[i][1] are the evaluations of val(k_j', 0) and val(k_j', 1) respectively
             let univariate_poly_evals: [F; 2] = (0..ra.len() / 2)
                 .into_par_iter()
                 .map(|i| {
@@ -116,6 +185,10 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
                     |running, new| [running[0] + new[0], running[1] + new[1]],
                 );
 
+            // Construct the univariate polynomial s_j(b) with evaluations:
+            // s_j(0) = univariate_poly_evals[0]
+            // s_j(1) = univariate_poly_evals[1]  
+            // s_j(2) = previous_claim - univariate_poly_evals[0] (ensures s_j(0) + s_j(1) + s_j(2) = previous_claim)
             let univariate_poly = UniPoly::from_evals(&[
                 univariate_poly_evals[0],
                 previous_claim - univariate_poly_evals[0],
@@ -129,12 +202,15 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
             compressed_poly.append_to_transcript(transcript);
             compressed_polys.push(compressed_poly);
 
+            // Get random challenge r_j for this round
             let r_j = transcript.challenge_scalar::<F>();
             r_address.push(r_j);
 
+            // Update the claim for the next round: previous_claim = s_j(r_j)
             previous_claim = univariate_poly.evaluate(&r_j);
 
-            // Bind polynomials
+            // Bind the polynomials by substituting r_j for the j-th variable
+            // This reduces the dimension from log K - j to log K - j - 1
             rayon::join(
                 || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
                 || val.bind_parallel(r_j, BindingOrder::LowToHigh),
@@ -144,10 +220,13 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         drop(_guard);
         drop(span);
 
+        // ra_claim = ra(r_address) where r_address is the final challenge vector
         let ra_claim = ra.final_sumcheck_claim();
 
         let core_piop_sumcheck_proof = SumcheckInstanceProof::new(compressed_polys);
 
+        // Prove the booleanity check: Σ_{k,t} EQ(r,k) * EQ(r',t) * (F(k,t)^2 - F(k,t)) = 0
+        // where F(k,t) = EQ(k, read_addresses[t]) and should be boolean (0 or 1)
         let (booleanity_sumcheck_proof, _r_address_prime, _r_cycle_prime, ra_claim_prime) =
             prove_booleanity(read_addresses, &r_address, E, F, transcript);
 
@@ -163,6 +242,11 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         }
     }
 
+    // Verification function for the SHOUT protocol
+    // 
+    // Mathematical verification checks:
+    // 1. Core PIOP: ra(r_address) * (z + val(r_address)) = sumcheck_claim
+    // 2. Booleanity: EQ(r_address, r_address') * EQ(r_cycle, r_cycle') * (ra_claim_prime^2 - ra_claim_prime) = 0
     pub fn verify(
         &self,
         lookup_table: Vec<F>,
@@ -173,26 +257,33 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
         let T = r_cycle.len().pow2();
         let z: F = transcript.challenge_scalar();
 
+        // Verify the core PIOP sumcheck: Σ_{k∈{0,1}^log K} ra(k) * (z + val(k)) = rv_claim + z
         let (sumcheck_claim, mut r_address) =
             self.core_piop_sumcheck
                 .verify(self.rv_claim + z, K.log_2(), 2, transcript)?;
         r_address = r_address.into_iter().rev().collect();
         let val = MultilinearPolynomial::from(lookup_table);
 
+        // Verify: ra(r_address) * (z + val(r_address)) = sumcheck_claim
         assert_eq!(
             self.ra_claim * (z + val.evaluate(&r_address)),
             sumcheck_claim,
             "Core PIOP + Hamming weight sumcheck failed"
         );
 
+        // Verify the booleanity sumcheck: Σ_{k,t} EQ(r,k) * EQ(r',t) * (F(k,t)^2 - F(k,t)) = 0
         let (sumcheck_claim, r_booleanity) =
             self.booleanity_sumcheck
                 .verify(F::zero(), K.log_2() + T.log_2(), 3, transcript)?;
         let (r_address_prime, r_cycle_prime) = r_booleanity.split_at(K.log_2());
+        
+        // Compute EQ(r_address, r_address') and EQ(r_cycle, r_cycle')
         let eq_eval_address = EqPolynomial::new(r_address).evaluate(r_address_prime);
         let r_cycle: Vec<_> = r_cycle.iter().copied().rev().collect();
         let eq_eval_cycle = EqPolynomial::new(r_cycle).evaluate(r_cycle_prime);
 
+        // Verify: EQ(r_address, r_address') * EQ(r_cycle, r_cycle') * (ra_claim_prime^2 - ra_claim_prime) = 0
+        // This ensures ra_claim_prime is boolean (0 or 1)
         assert_eq!(
             eq_eval_address * eq_eval_cycle * (self.ra_claim_prime.square() - self.ra_claim_prime),
             sumcheck_claim,
@@ -208,6 +299,9 @@ impl<F: JoltField, ProofTranscript: Transcript> ShoutProof<F, ProofTranscript> {
 
 /// Implements the sumcheck prover for the core Shout PIOP when d = 1. See
 /// Figure 5 from the Twist+Shout paper.
+///
+/// Mathematical equation: Σ_{k∈{0,1}^log K} ra(k) * val(k) = Σ_{t∈[T]} val(read_addresses[t])
+/// where ra(k) = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
 pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
     lookup_table: Vec<F>,
     read_addresses: Vec<usize>,
@@ -221,7 +315,11 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
     let num_rounds = K.log_2();
     let mut r_address: Vec<F> = Vec::with_capacity(num_rounds);
 
+    // E[t] = EQ(r_cycle, t) for t ∈ [T]
     let E: Vec<F> = EqPolynomial::evals(&r_cycle);
+    
+    // F[k] = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+    // This computes how many times each address k is read, weighted by cycle consistency
     let F: Vec<_> = (0..K)
         .into_par_iter()
         .map(|k| {
@@ -233,6 +331,7 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
         })
         .collect();
 
+    // Initial sumcheck claim: Σ_{k∈[K]} F[k] * val[k] = Σ_{k∈[K]} ra(k) * val(k)
     let sumcheck_claim: F = F
         .par_iter()
         .zip(lookup_table.par_iter())
@@ -293,6 +392,9 @@ pub fn prove_core_shout_piop<F: JoltField, ProofTranscript: Transcript>(
 /// Implements the sumcheck prover for the Booleanity check in step 3 of
 /// Figure 6 in the Twist+Shout paper. The efficient implementation of this
 /// sumcheck is described in Section 6.3.
+///
+/// Mathematical equation: Σ_{k∈{0,1}^log K, t∈[T]} EQ(r, k) * EQ(r', t) * (F(k,t)^2 - F(k,t)) = 0
+/// where F(k,t) = EQ(k, read_addresses[t]) and should be boolean (0 or 1)
 #[tracing::instrument(skip_all, name = "Shout booleanity sumcheck")]
 pub fn prove_booleanity<F: JoltField, ProofTranscript: Transcript>(
     read_addresses: Vec<usize>,
@@ -307,6 +409,8 @@ pub fn prove_booleanity<F: JoltField, ProofTranscript: Transcript>(
     debug_assert_eq!(D.len(), T);
     debug_assert_eq!(G.len(), K);
 
+    // B = EQ(r, k) for k ∈ {0,1}^log K
+    // This creates the equality polynomial for address consistency
     let mut B = MultilinearPolynomial::from(EqPolynomial::evals(r)); // (53)
 
     // First log(K) rounds of sumcheck
@@ -540,6 +644,10 @@ pub fn prove_booleanity<F: JoltField, ProofTranscript: Transcript>(
 
 /// Implements the sumcheck prover for the Hamming weight 1 check in step 5 of
 /// Figure 6 in the Twist+Shout paper.
+///
+/// Mathematical equation: Σ_{k∈{0,1}^log K} ra(k) = 1
+/// where ra(k) = Σ_{t∈[T]} EQ(r_cycle_prime, t) * δ(k, read_addresses[t])
+/// This ensures that exactly one address is read in each cycle
 pub fn prove_hamming_weight<F: JoltField, ProofTranscript: Transcript>(
     lookup_table: Vec<F>,
     read_addresses: Vec<usize>,
@@ -553,7 +661,11 @@ pub fn prove_hamming_weight<F: JoltField, ProofTranscript: Transcript>(
     let num_rounds = K.log_2();
     let mut r_address_double_prime: Vec<F> = Vec::with_capacity(num_rounds);
 
+    // E[t] = EQ(r_cycle_prime, t) for t ∈ [T]
     let E: Vec<F> = EqPolynomial::evals(&r_cycle_prime);
+    
+    // F[k] = Σ_{t∈[T]} EQ(r_cycle_prime, t) * δ(k, read_addresses[t])
+    // This computes how many times each address k is read in the prime cycle
     let F: Vec<_> = (0..K)
         .into_par_iter()
         .map(|k| {
@@ -566,7 +678,10 @@ pub fn prove_hamming_weight<F: JoltField, ProofTranscript: Transcript>(
         .collect();
 
     let mut ra = MultilinearPolynomial::from(F);
+    // Initial claim: Σ_{k∈{0,1}^log K} ra(k) = 1 (Hamming weight should be 1)
     let mut previous_claim = F::one();
+
+    const DEGREE: usize = 2;
 
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
     for _ in 0..num_rounds {
@@ -600,6 +715,10 @@ pub fn prove_hamming_weight<F: JoltField, ProofTranscript: Transcript>(
 
 /// Implements the sumcheck prover for the raf-evaluation sumcheck in step 6 of
 /// Figure 6 in the Twist+Shout paper.
+///
+/// Mathematical equation: Σ_{k∈{0,1}^log K} ra(k) * k = Σ_{t∈[T]} read_addresses[t] * EQ(r_cycle, t)
+/// where ra(k) = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+/// This ensures the read address function (RAF) is correctly evaluated
 pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
     lookup_table: Vec<F>,
     read_addresses: Vec<usize>,
@@ -611,7 +730,11 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
     let T = read_addresses.len();
     debug_assert_eq!(T.log_2(), r_cycle.len());
 
+    // E[t] = EQ(r_cycle, t) for t ∈ [T]
     let E: Vec<F> = EqPolynomial::evals(&r_cycle);
+    
+    // F[k] = Σ_{t∈[T]} EQ(r_cycle, t) * δ(k, read_addresses[t])
+    // This computes how many times each address k is read, weighted by cycle consistency
     let F: Vec<_> = (0..K)
         .into_par_iter()
         .map(|k| {
@@ -627,14 +750,18 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
     let mut r_address_double_prime: Vec<F> = Vec::with_capacity(num_rounds);
 
     let mut ra = MultilinearPolynomial::from(F);
+    // int(k) = k: Identity polynomial that maps each address to its value
     let mut int = IdentityPolynomial::new(num_rounds);
 
+    // Initial claim: Σ_{k∈{0,1}^log K} ra(k) * k = claimed_evaluation
     let mut previous_claim = claimed_evaluation;
 
     const DEGREE: usize = 2;
 
     let mut compressed_polys: Vec<CompressedUniPoly<F>> = Vec::with_capacity(num_rounds);
     for _ in 0..num_rounds {
+        // For each round j, compute the univariate polynomial:
+        // s_j(b) = Σ_{k_j'∈{0,1}^(log K - j-1)} ra(k_j', b) * int(k_j', b)
         let univariate_poly_evals: [F; 2] = (0..ra.len() / 2)
             .into_par_iter()
             .map(|i| {
@@ -648,6 +775,10 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
                 |running, new| [running[0] + new[0], running[1] + new[1]],
             );
 
+        // Construct the univariate polynomial s_j(b) with evaluations:
+        // s_j(0) = univariate_poly_evals[0]
+        // s_j(1) = univariate_poly_evals[1]
+        // s_j(2) = previous_claim - univariate_poly_evals[0] (ensures s_j(0) + s_j(1) + s_j(2) = previous_claim)
         let univariate_poly = UniPoly::from_evals(&[
             univariate_poly_evals[0],
             previous_claim - univariate_poly_evals[0],
@@ -658,18 +789,22 @@ pub fn prove_raf_evaluation<F: JoltField, ProofTranscript: Transcript>(
         compressed_poly.append_to_transcript(transcript);
         compressed_polys.push(compressed_poly);
 
+        // Get random challenge r_j for this round
         let r_j = transcript.challenge_scalar::<F>();
         r_address_double_prime.push(r_j);
 
+        // Update the claim for the next round: previous_claim = s_j(r_j)
         previous_claim = univariate_poly.evaluate(&r_j);
 
-        // Bind polynomials
+        // Bind the polynomials by substituting r_j for the j-th variable
+        // This reduces the dimension from log K - j to log K - j - 1
         rayon::join(
             || ra.bind_parallel(r_j, BindingOrder::LowToHigh),
             || int.bind_parallel(r_j, BindingOrder::LowToHigh),
         );
     }
 
+    // ra_claim = ra(r_address_double_prime) where r_address_double_prime is the final challenge vector
     let ra_claim = ra.final_sumcheck_claim();
     (SumcheckInstanceProof::new(compressed_polys), ra_claim)
 }
